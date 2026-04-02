@@ -57,8 +57,8 @@ OOS_DECAY_MAX  = 0.12
 MIN_BUCKET_N   = 30
 
 # Data windows
-TRAIN_MONTHS   = 18
-VAL_MONTHS     = 5
+TRAIN_MONTHS   = 12
+VAL_MONTHS     = 3
 BUFFER_DAYS    = 30
 
 
@@ -109,13 +109,13 @@ def _yf_info(ticker):
     sector, industry. Returns {} on failure.
     """
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker, session=None).fast_info
         return {
-            "market_cap":         info.get("marketCap", 0) or 0,
-            "float_shares":       info.get("floatShares", 0) or 0,
-            "shares_outstanding": info.get("sharesOutstanding", 0) or 0,
-            "sector":             info.get("sector", "") or "",
-            "industry":           info.get("industry", "") or "",
+            "market_cap":         getattr(info, "market_cap", 0) or 0,
+            "float_shares":       getattr(info, "float_shares", 0) or 0,
+            "shares_outstanding": getattr(info, "shares", 0) or 0,
+            "sector":             "",
+            "industry":           "",
         }
     except Exception as e:
         _log(f"yfinance error {ticker}: {e}")
