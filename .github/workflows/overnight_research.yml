@@ -1,0 +1,225 @@
+name: Scorpion Autoresearch
+
+on:
+  schedule:
+    - cron: '0 3 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      target_bucket:
+        description: 'Specific bucket key (empty = auto-rotate)'
+        required: false
+        default: ''
+      budget:
+        description: 'Experiments per agent'
+        required: false
+        default: '100'
+
+permissions:
+  contents: write
+
+jobs:
+
+  prepare:
+    name: Build bucket list
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      top-buckets: ${{ steps.buckets.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance requests pandas numpy pytz anthropic
+
+      - name: Build bucket stats from fresh Polygon data
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: |
+          python3 -c "
+          import prepare
+          df_train, df_val, bars_train, bars_val = prepare.load_all_data()
+          print('buckets.json written')
+          "
+
+      - name: Upload buckets.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: buckets-json
+          path: buckets.json
+          retention-days: 1
+
+      - name: Get top 5 valid buckets
+        id: buckets
+        run: |
+          LIST=$(python3 -c "
+          import prepare, json
+          b = prepare.get_valid_buckets()[:5]
+          print(json.dumps(b))
+          ")
+          echo "list=$LIST" >> $GITHUB_OUTPUT
+
+  research:
+    name: Agent (${{ matrix.bucket }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+    strategy:
+      fail-fast: false
+      matrix:
+        bucket: ${{ fromJSON(needs.prepare.outputs.top-buckets) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance requests pandas numpy pytz anthropic
+
+      - name: Download buckets.json
+        uses: actions/download-artifact@v4
+        with:
+          name: buckets-json
+
+      - name: Git identity
+        run: |
+          git config user.name "scorpion-agent"
+          git config user.email "agent@scorpion.ai"
+
+      - name: Run autoresearch loop
+        env:
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          POLYGON_API_KEY:     ${{ secrets.POLYGON_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TARGET_BUCKET:       ${{ matrix.bucket }}
+          EXPERIMENT_BUDGET:   ${{ inputs.budget || '100' }}
+        run: python3 orchestrator.py
+
+      - name: Push results back to repo
+        if: always()
+        run: |
+          git pull --rebase origin main || true
+          git add results.tsv train.py || true
+          git diff --staged --quiet || \
+            git commit -m "[${{ matrix.bucket }}] $(date +%Y-%m-%d)"
+          git push || true
+
+  report:
+    name: Tournament report
+    needs: research
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - run: git pull
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas requests
+
+      - name: Summarize results and send Discord report
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 << 'EOF'
+          import os, requests
+          import pandas as pd
+          from pathlib import Path
+
+          if not Path("results.tsv").exists():
+              print("No results.tsv yet")
+              exit(0)
+
+          df = pd.read_csv("results.tsv", sep="\t")
+          if df.empty:
+              exit(0)
+
+          df = df.sort_values("score", ascending=False)
+          passed = df[df["score"] > 0]
+
+          def lvl(n):
+              if n < 30:  return "L1-SKIP"
+              if n < 100: return "L2-10%"
+              if n < 500: return "L3-25%"
+              return "L4-FULL"
+
+          print(f"\n=== SCORPION {pd.Timestamp.now():%Y-%m-%d} ===")
+          print(f"Total experiments: {len(df)}")
+          print(f"Passed all gates:  {len(passed)}")
+          print(f"Buckets covered:   {df['bucket_key'].nunique()}")
+          print()
+
+          for _, r in df.head(10).iterrows():
+              lv = lvl(r.get("n_train", 0))
+              print(f"[{lv}] score={r['score']:.4f} "
+                    f"WR={r['wr_train']:.1%} "
+                    f"ret={r['avg_ret_train']:.1%} "
+                    f"N/mo={r['n_per_month_train']:.1f} "
+                    f"t={r.get('entry_time_key','?')}")
+              print(f"  bucket:  {r['bucket_key']}")
+              print(f"  screen:  {r.get('screen_desc','')}")
+              print(f"  entry:   {r.get('entry_desc','')}")
+              print(f"  why:     {r.get('mechanism','')}")
+              print()
+
+          # Save promoted signals (passed all gates)
+          if len(passed) > 0:
+              passed.head(20).to_csv("promoted_signals.csv", index=False)
+              print(f"Saved {min(len(passed),20)} signals to promoted_signals.csv")
+
+          # Discord
+          wh = os.environ.get("DISCORD_WEBHOOK_URL", "")
+          if wh and len(df) > 0:
+              lines = [
+                  f"**SCORPION AUTORESEARCH — {pd.Timestamp.now():%Y-%m-%d}**",
+                  f"Experiments: `{len(df)}` | Passed: `{len(passed)}` | Buckets: `{df['bucket_key'].nunique()}`\n"
+              ]
+              for _, r in df.head(5).iterrows():
+                  lv = lvl(r.get("n_train", 0))
+                  lines.append(
+                      f"**[{lv}]** `{r['bucket_key']}`\n"
+                      f"score=`{r['score']:.4f}` "
+                      f"WR=`{r['wr_train']:.1%}` "
+                      f"ret=`{r['avg_ret_train']:.1%}` "
+                      f"N/mo=`{r['n_per_month_train']:.1f}` "
+                      f"t=`{r.get('entry_time_key','?')}`\n"
+                      f"screen: _{r.get('screen_desc','')}_\n"
+                      f"entry: _{r.get('entry_desc','')}_\n"
+                      f"why: _{r.get('mechanism','')}_"
+                  )
+              try:
+                  requests.post(
+                      wh,
+                      json={"content": "\n".join(lines)[:2000]},
+                      timeout=10
+                  )
+                  print("Discord report sent")
+              except Exception as e:
+                  print(f"Discord error: {e}")
+          EOF
+
+      - name: Push promoted signals
+        if: always()
+        run: |
+          git config user.name "scorpion-tournament"
+          git config user.email "tournament@scorpion.ai"
+          git add results.tsv promoted_signals.csv || true
+          git diff --staged --quiet || \
+            git commit -m "report $(date +%Y-%m-%d)"
+          git push || true
