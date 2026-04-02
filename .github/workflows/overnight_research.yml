@@ -22,7 +22,7 @@ jobs:
   prepare:
     name: Build bucket list
     runs-on: ubuntu-latest
-    timeout-minutes: 85
+    timeout-minutes: 360
     outputs:
       top-buckets: ${{ steps.buckets.outputs.list }}
     steps:
@@ -68,7 +68,7 @@ jobs:
     name: Agent (${{ matrix.bucket }})
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 320
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -118,7 +118,7 @@ jobs:
     needs: research
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
