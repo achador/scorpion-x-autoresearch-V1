@@ -58,9 +58,13 @@ jobs:
         id: buckets
         run: |
           LIST=$(python3 -c "
-          import prepare, json
-          b = prepare.get_valid_buckets()[:5]
-          print(json.dumps(b))
+          import json
+          stats = json.loads(open('buckets.json').read())
+          valid = sorted(
+              [k for k,v in stats.items() if v.get('valid')],
+              key=lambda k: stats[k]['base_wr'], reverse=True
+          )[:5]
+          print(json.dumps(valid))
           ")
           echo "list=$LIST" >> $GITHUB_OUTPUT
 
